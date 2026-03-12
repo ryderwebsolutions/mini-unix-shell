@@ -30,6 +30,10 @@
 #include <limits.h>
 #include <errno.h>
 
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
 #include "parser.h"
 #include "executor.h"
 #include "builtins.h"

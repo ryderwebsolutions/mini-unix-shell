@@ -13,7 +13,7 @@
 # =============================================================================
 
 CC      := gcc
-CFLAGS  := -std=c11 -Wall -Wextra -Wpedantic -g
+CFLAGS  := -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Wpedantic -g
 
 TARGET  := mysh
 PREFIX  := /usr/local
