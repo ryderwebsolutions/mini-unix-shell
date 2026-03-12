@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 
@@ -12,14 +13,30 @@
 #include "utils.h"
 
 /* =========================================================================
- * Helpers
+ * POSIX-standard exit codes for exec failures
+ *
+ *   127  command not found  (ENOENT from execvp)
+ *   126  command found but not executable  (EACCES / ENOEXEC)
+ *   1    any other exec error
  * ========================================================================= */
+#define EXIT_CMD_NOT_FOUND   127
+#define EXIT_CMD_NOT_EXEC    126
 
-/* Apply the I/O redirections specified in `cmd` to the current process.
- * Called from the child after fork(), and also (with dup2 save/restore)
- * when running a built-in in-process so that the shell's own fds survive. */
+/* =========================================================================
+ * I/O Redirection helper
+ * =========================================================================
+ *
+ * apply_redirections – wire the file descriptors requested by `cmd`.
+ *
+ * Must be called in the child process (after fork) before execvp().
+ * Also called in-process for built-ins, wrapped in an fd save/restore so
+ * the shell's own stdin/stdout are not permanently altered.
+ *
+ * Returns 0 on success, -1 on error (message already printed to stderr).
+ * ========================================================================= */
 static int apply_redirections(Command *cmd)
 {
+    /* Input redirection: open the source file and point stdin at it. */
     if (cmd->input_file) {
         int fd = open(cmd->input_file, O_RDONLY);
         if (fd < 0) {
@@ -27,10 +44,16 @@ static int apply_redirections(Command *cmd)
                     cmd->input_file, strerror(errno));
             return -1;
         }
+        /*
+         * dup2(oldfd, newfd) makes newfd refer to the same open-file
+         * description as oldfd, then closes oldfd.  After this call,
+         * STDIN_FILENO reads from the file we just opened.
+         */
         dup2(fd, STDIN_FILENO);
-        close(fd);
+        close(fd);   /* fd is no longer needed; STDIN_FILENO holds the reference */
     }
 
+    /* Output redirection: open/create the target file and point stdout at it. */
     if (cmd->output_file) {
         int flags = O_WRONLY | O_CREAT |
                     (cmd->append ? O_APPEND : O_TRUNC);
@@ -48,18 +71,27 @@ static int apply_redirections(Command *cmd)
 }
 
 /* =========================================================================
- * Single-command fast path (no pipe)
+ * Built-in in-process execution (with fd save/restore)
+ * =========================================================================
+ *
+ * Built-ins must run in the shell process so they can mutate its state
+ * (cd changes cwd, export changes environ, exit terminates the process).
+ * But they still need to respect I/O redirections.
+ *
+ * Strategy: save the real stdin/stdout fds with dup(), apply redirections,
+ * run the built-in, then restore with dup2() so subsequent commands are
+ * unaffected.
  * ========================================================================= */
-
-/*
- * Run a built-in in-process, but honour redirections by temporarily
- * replacing stdin/stdout and restoring them afterwards.
- */
 static int run_builtin_inprocess(Command *cmd)
 {
-    /* Save originals */
     int saved_in  = dup(STDIN_FILENO);
     int saved_out = dup(STDOUT_FILENO);
+    if (saved_in < 0 || saved_out < 0) {
+        perror("dup");
+        if (saved_in  >= 0) close(saved_in);
+        if (saved_out >= 0) close(saved_out);
+        return 1;
+    }
 
     int status = 0;
     if (apply_redirections(cmd) < 0) {
@@ -67,9 +99,10 @@ static int run_builtin_inprocess(Command *cmd)
         goto restore;
     }
 
-    status = execute_builtin(cmd);   /* may call exit() for 'exit' built-in */
+    status = execute_builtin(cmd);  /* 'exit' built-in will call exit() here */
 
 restore:
+    /* Restore the shell's original stdin/stdout regardless of errors above */
     dup2(saved_in,  STDIN_FILENO);
     dup2(saved_out, STDOUT_FILENO);
     close(saved_in);
@@ -77,17 +110,73 @@ restore:
     return status;
 }
 
-static int run_external(Command *cmd, int background)
+/* =========================================================================
+ * Core: fork + execvp + optional wait
+ * =========================================================================
+ *
+ * fork_and_exec – the fundamental unit of external command execution.
+ *
+ * Steps:
+ *   1. fork()    — duplicate the current process.
+ *   2. child:    reset signals, wire fds, call execvp().
+ *   3. parent:   either wait (foreground) or record pid (background).
+ *
+ * Why execvp() over execve()?
+ *   execvp() searches PATH automatically, matching what users expect when
+ *   they type "ls" instead of "/bin/ls".  execve() requires an absolute
+ *   path and a manually constructed envp[].
+ *
+ * Exit code conventions after exec failure:
+ *   ENOENT  → 127  (command not found — mirrors bash/sh behaviour)
+ *   EACCES  → 126  (found but not executable)
+ *   other   → 1    (unexpected error)
+ *
+ * Returns the child's exit status for foreground commands, 0 for background,
+ * or -1 if fork() itself failed.
+ * ========================================================================= */
+static int fork_and_exec(Command *cmd, int background)
 {
+    /*
+     * Step 1: fork()
+     *
+     * fork() creates an exact copy of the calling process.
+     * After the call:
+     *   parent receives: child's pid (> 0)
+     *   child  receives: 0
+     *   on failure:     -1 (no child is created)
+     */
     pid_t pid = fork();
+
     if (pid < 0) {
-        perror("fork");
+        /* fork failed — OS may be out of process slots or memory */
+        perror("shell: fork");
         return -1;
     }
 
+    /* ------------------------------------------------------------------ */
+    /* CHILD PROCESS                                                        */
+    /* ------------------------------------------------------------------ */
     if (pid == 0) {
-        /* --- child --- */
-        /* Background processes detach stdin so they don't race for input. */
+
+        /*
+         * Step 2a: reset signal dispositions inherited from the shell.
+         *
+         * The shell set SIGINT to SIG_IGN so Ctrl-C doesn't kill it.
+         * Children inherit that disposition across fork(), which means
+         * without this reset, Ctrl-C would silently do nothing in the
+         * child too.  We restore the kernel default (terminate) so the
+         * child behaves like any normal process.
+         */
+        signal(SIGINT, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+
+        /*
+         * Step 2b: background processes detach from stdin.
+         *
+         * If a background process tries to read from the terminal it would
+         * block (or get SIGTTIN).  Redirect its stdin to /dev/null so it
+         * fails immediately with EOF instead of stalling indefinitely.
+         */
         if (background) {
             int devnull = open("/dev/null", O_RDONLY);
             if (devnull >= 0) {
@@ -96,29 +185,104 @@ static int run_external(Command *cmd, int background)
             }
         }
 
+        /*
+         * Step 2c: apply any < > >> redirections from the command.
+         * On failure the error is already printed; exit with code 1.
+         */
         if (apply_redirections(cmd) < 0)
             exit(1);
 
+        /*
+         * Step 2d: execvp() — replace this process image with the program.
+         *
+         * execvp() searches each directory in PATH for cmd->argv[0].
+         * On success it never returns — the new program takes over entirely.
+         * On failure it returns -1 and sets errno.
+         */
         execvp(cmd->argv[0], cmd->argv);
-        /* execvp only returns on error */
-        fprintf(stderr, "shell: %s: %s\n", cmd->argv[0], strerror(errno));
-        exit(127);
+
+        /*
+         * execvp() returned — the command could not be launched.
+         * Translate errno to a POSIX-standard exit code and print a
+         * diagnostic before exiting the child.
+         */
+        switch (errno) {
+            case ENOENT:
+                fprintf(stderr, "shell: %s: command not found\n",
+                        cmd->argv[0]);
+                exit(EXIT_CMD_NOT_FOUND);  /* 127 */
+
+            case EACCES:
+            /* ENOEXEC covers "file exists but is not a valid executable" */
+            case ENOEXEC:
+                fprintf(stderr, "shell: %s: permission denied\n",
+                        cmd->argv[0]);
+                exit(EXIT_CMD_NOT_EXEC);   /* 126 */
+
+            default:
+                fprintf(stderr, "shell: %s: %s\n",
+                        cmd->argv[0], strerror(errno));
+                exit(1);
+        }
     }
 
-    /* --- parent --- */
+    /* ------------------------------------------------------------------ */
+    /* PARENT PROCESS                                                       */
+    /* ------------------------------------------------------------------ */
+
+    /*
+     * Background: record the child's pid for the user and return immediately.
+     * The child will be reaped later by the SIGCHLD handler in shell.c.
+     */
     if (background) {
         printf("[bg] pid %d\n", pid);
         return 0;
     }
 
+    /*
+     * Step 3: waitpid() — suspend the parent until the child finishes.
+     *
+     * waitpid(pid, &wstatus, 0):
+     *   pid     = exactly this child (not any child)
+     *   wstatus = output: encodes how the child terminated
+     *   flags   = 0 means block until the child changes state
+     *
+     * We loop on EINTR to transparently restart if waitpid is interrupted
+     * by a signal (e.g. SIGCHLD from an unrelated background child).
+     *
+     * Decode wstatus with the W* macros:
+     *   WIFEXITED(ws)   true if child called exit() / returned from main()
+     *   WEXITSTATUS(ws) the value passed to exit()  (only valid if above)
+     *   WIFSIGNALED(ws) true if child was killed by a signal
+     *   WTERMSIG(ws)    the signal number             (only valid if above)
+     *
+     * Convention: signal-killed exit status = 128 + signal_number
+     * (mirrors bash; allows the caller to distinguish normal vs signal exit)
+     */
     int wstatus;
-    waitpid(pid, &wstatus, 0);
+    while (waitpid(pid, &wstatus, 0) < 0) {
+        if (errno != EINTR) {
+            perror("shell: waitpid");
+            return -1;
+        }
+    }
+
     if (WIFEXITED(wstatus))
         return WEXITSTATUS(wstatus);
-    if (WIFSIGNALED(wstatus))
+
+    if (WIFSIGNALED(wstatus)) {
+        /* Mimic bash: print "Terminated" for SIGTERM, etc. */
+        fprintf(stderr, "shell: %s: %s\n",
+                cmd->argv[0], strsignal(WTERMSIG(wstatus)));
         return 128 + WTERMSIG(wstatus);
-    return -1;
+    }
+
+    return -1;   /* stopped or other uncommon state */
 }
+
+/* Thin public wrappers so callers don't pass a bare int flag */
+static int run_foreground(Command *cmd) { return fork_and_exec(cmd, 0); }
+static int run_background(Command *cmd) { return fork_and_exec(cmd, 1); }
 
 /* =========================================================================
  * Pipeline execution
@@ -193,10 +357,21 @@ static int run_pipeline(Pipeline *p)
             if (is_builtin(cmd->argv[0])) {
                 exit(execute_builtin(cmd));
             } else {
+                /* Reset signals in this pipeline child too */
+                signal(SIGINT,  SIG_DFL);
+                signal(SIGQUIT, SIG_DFL);
                 execvp(cmd->argv[0], cmd->argv);
-                fprintf(stderr, "shell: %s: %s\n",
-                        cmd->argv[0], strerror(errno));
-                exit(127);
+                switch (errno) {
+                    case ENOENT:
+                        fprintf(stderr, "shell: %s: command not found\n", cmd->argv[0]);
+                        exit(EXIT_CMD_NOT_FOUND);
+                    case EACCES: case ENOEXEC:
+                        fprintf(stderr, "shell: %s: permission denied\n", cmd->argv[0]);
+                        exit(EXIT_CMD_NOT_EXEC);
+                    default:
+                        fprintf(stderr, "shell: %s: %s\n", cmd->argv[0], strerror(errno));
+                        exit(1);
+                }
             }
         }
 
@@ -237,19 +412,27 @@ int execute_pipeline(Pipeline *p)
     if (p->count == 0)
         return 0;
 
-    /* Fast path: single command */
+    /* ------------------------------------------------------------------ */
+    /* Fast path: single command (no pipe involved)                        */
+    /* ------------------------------------------------------------------ */
     if (p->count == 1) {
         Command *cmd = p->commands[0];
 
         if (cmd->argc == 0)
             return 0;
 
+        /*
+         * Built-ins run in-process (they need to mutate shell state).
+         * All other commands go through fork + execvp.
+         */
         if (is_builtin(cmd->argv[0]))
             return run_builtin_inprocess(cmd);
 
-        return run_external(cmd, p->background);
+        return p->background ? run_background(cmd) : run_foreground(cmd);
     }
 
-    /* Multi-command pipeline */
+    /* ------------------------------------------------------------------ */
+    /* Pipeline: two or more commands joined by '|'                        */
+    /* ------------------------------------------------------------------ */
     return run_pipeline(p);
 }
