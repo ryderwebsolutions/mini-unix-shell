@@ -14,7 +14,8 @@
  *   echo     [args...]      print arguments separated by spaces
  *   export   [NAME=VALUE…]  set environment variables (no args → print all)
  *   unset    NAME…          remove environment variables
- *   history                 print command history
+ *   history                 print command history (last 512 entries)
+ *   help                    list all built-in commands with descriptions
  *   exit     [code]         exit the shell with optional exit code
  */
 
@@ -35,5 +36,11 @@ int execute_builtin(Command *cmd);
  * Called by shell.c after every non-empty input line.
  */
 void history_add(const char *line);
+
+/*
+ * history_free – release all heap memory held by the history buffer.
+ * Register with atexit() in main() so valgrind reports a clean run.
+ */
+void history_free(void);
 
 #endif /* BUILTINS_H */

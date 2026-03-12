@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <limits.h>     /* PATH_MAX */
 
 #include "builtins.h"
 #include "utils.h"
@@ -27,6 +28,15 @@ void history_add(const char *line)
                 (HISTORY_SIZE - 1) * sizeof(char *));
         history_buf[HISTORY_SIZE - 1] = safe_strdup(line);
     }
+}
+
+void history_free(void)
+{
+    for (int i = 0; i < history_count; i++) {
+        free(history_buf[i]);
+        history_buf[i] = NULL;
+    }
+    history_count = 0;
 }
 
 /* =========================================================================
@@ -55,7 +65,7 @@ static int builtin_cd(Command *cmd)
 static int builtin_pwd(Command *cmd)
 {
     (void)cmd;
-    char buf[4096];
+    char buf[PATH_MAX];   /* POSIX maximum path length, not a magic number */
     if (!getcwd(buf, sizeof(buf))) {
         perror("pwd");
         return 1;
@@ -135,6 +145,33 @@ static int builtin_exit(Command *cmd)
     exit(code);
 }
 
+/* help
+ * Prints a summary of every built-in command.
+ * The list is maintained in a local table so it stays in sync with the
+ * dispatch table above without any duplication of logic. */
+static int builtin_help(Command *cmd)
+{
+    (void)cmd;
+    static const struct { const char *usage; const char *desc; } entries[] = {
+        { "cd [dir]",          "Change working directory (default: $HOME)"    },
+        { "pwd",               "Print current working directory"              },
+        { "echo [args...]",    "Print arguments to stdout"                    },
+        { "export [NAME=VAL]", "Set env variable (no args: list all)"         },
+        { "unset NAME...",     "Remove environment variable(s)"               },
+        { "history",           "Show command history (last 512 entries)"      },
+        { "help",              "Show this help message"                       },
+        { "exit [code]",       "Exit the shell with an optional exit code"    },
+        { NULL, NULL }
+    };
+
+    puts("Built-in commands:");
+    puts("");
+    for (int i = 0; entries[i].usage; i++)
+        printf("  %-24s %s\n", entries[i].usage, entries[i].desc);
+    puts("");
+    return 0;
+}
+
 /* =========================================================================
  * Dispatch table
  * ========================================================================= */
@@ -151,6 +188,7 @@ static const Builtin dispatch[] = {
     { "export",  builtin_export  },
     { "unset",   builtin_unset   },
     { "history", builtin_history },
+    { "help",    builtin_help    },
     { "exit",    builtin_exit    },
     { NULL,      NULL            },  /* sentinel */
 };

@@ -44,6 +44,12 @@ static int tokenise(const char *line, TokenList *out)
         if (!*p)
             break;
 
+        /* --- comments: '#' outside quotes starts a line comment ---
+         * Everything from '#' to end-of-line is discarded.  This lets
+         * shell scripts use comments and matches POSIX sh behaviour. */
+        if (*p == '#')
+            break;
+
         /* --- single-character operators: | < & --- */
         if (*p == '|' || *p == '<' || *p == '&') {
             char op[2] = { *p, '\0' };

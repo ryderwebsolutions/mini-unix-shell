@@ -272,6 +272,13 @@ static void run_repl(void)
 
 int main(void)
 {
+    /*
+     * Register history_free() so heap-allocated history strings are released
+     * on exit().  This keeps valgrind --leak-check=full clean, which matters
+     * when grading or demonstrating the project.
+     */
+    atexit(history_free);
+
     setup_signals();
     run_repl();
     return last_exit_status;
